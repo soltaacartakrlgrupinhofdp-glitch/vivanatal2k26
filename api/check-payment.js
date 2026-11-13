@@ -1,14 +1,9 @@
-import {pagouRequest} from './pagou-client.js';
+import {bluepag,fail} from './bluepag-client.js';
 export default async function handler(req,res){
- res.setHeader('Cache-Control','no-store');
- if(!['GET','POST'].includes(req.method))return res.status(405).json({success:false,error:'Método não permitido'});
- const x=req.method==='POST'?req.body||{}:req.query||{};
- const id=String(x.transaction_id||x.txid||'');
- if(!/^[a-zA-Z0-9_-]{8,128}$/.test(id))return res.status(400).json({success:false,error:'ID inválido'});
- try{
-  const result=await pagouRequest(`/v2/transactions/${encodeURIComponent(id)}`);
-  const d=result.data||result, raw=String(d.status||'unknown').toLowerCase();
-  const status=raw==='paid'?'paid':raw==='pending'?'pending':raw;
-  return res.status(200).json({success:true,transaction_id:id,status,allowpay_status:raw,amount:d.amount||0,last_check:new Date().toISOString()});
- }catch(e){return res.status(502).json({success:false,error:'Falha ao consultar Pagou',requestId:e.requestId||null});}
+ if(!['POST','GET'].includes(req.method))return res.status(405).json({success:false,error:'Método inválido'});
+ const id=String((req.method==='POST'?req.body:req.query)?.transaction_id||'');
+ if(!/^[0-9a-f-]{36}$/i.test(id))return res.status(400).json({success:false,error:'ID inválido'});
+ try{const d=(await bluepag('/payments/'+encodeURIComponent(id))).data||{};
+ const raw=String(d.status||'').toLowerCase();return res.status(200).json({success:true,transaction_id:id,status:raw==='completed'?'paid':raw==='pending'?'pending':['failed','canceled','cancelled','expired'].includes(raw)?(raw==='cancelled'?'canceled':raw):raw,source:'bluepag',amount:Number(d.amount_gross??d.amount??0),last_check:new Date().toISOString()});
+ }catch(e){return fail(res,e)}
 }

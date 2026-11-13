@@ -1,12 +1,11 @@
 import { timingSafeEqual } from 'node:crypto';
 const url=process.env.UPSTASH_REDIS_REST_URL;
 const token=process.env.UPSTASH_REDIS_REST_TOKEN;
-import {pagouRequest} from './pagou-client.js';
 const TTL=60*60*24*90;
 const ID_RE=/^[-\w]{5,128}$/;
 
 function authorized(req){
- const expected='593120';
+ const expected=process.env.ADMIN_PASSWORD||'';
  const supplied=(req.headers.authorization||'').replace(/^Bearer\s+/i,'');
  if(!expected||!supplied)return false;
  const a=Buffer.from(supplied),b=Buffer.from(expected);
@@ -59,14 +58,25 @@ function agrupar(rows){
 }
 
 // Confirma no gateway antes de marcar como paga (evita que alguém marque fichas falsamente)
+// Consulta a cobrança diretamente na BluePag antes de confirmar uma ficha.
 async function pagoNoGateway(id){
- try{const j=await pagouRequest(`/v2/transactions/${encodeURIComponent(id)}`);return String((j.data||j).status||'').toLowerCase()==='paid'}catch{return false}
+ try{const {bluepag}=await import('./bluepag-client.js');const d=(await bluepag('/payments/'+encodeURIComponent(id))).data||{};return d.status==='completed'}catch(e){console.error('BluePag confirmation failed',e.status||502);return false}
 }
 
 export default async function handler(req,res){
  res.setHeader('Cache-Control','no-store');
  if(!url||!token)return res.status(503).json({error:'Configure UPSTASH_REDIS_REST_URL e UPSTASH_REDIS_REST_TOKEN na Vercel'});
  try{
+  if(req.method==='POST'&&req.body?.action==='import'){
+   if(!authorized(req))return res.status(401).json({error:'Não autorizado'});
+   const payload=req.body.payload||{},rows=payload.fichas;
+   if(payload.format!=='fichas-portable-v1'||!Array.isArray(rows)||rows.length>1000)return res.status(400).json({error:'JSON inválido ou lote acima de 1000 fichas'});
+   let imported=0,skipped=0;
+   for(const item of rows){if(!item||!ID_RE.test(String(item.id||''))||!/^\d{11}$/.test(String(item.cpf||''))||await getFicha(item.id)){skipped++;continue}
+    const clean={id:String(item.id),cpf:String(item.cpf),nome:String(item.nome||'').slice(0,120),data_nascimento:String(item.data_nascimento||'').slice(0,30),telefone:String(item.telefone||'').replace(/\D/g,'').slice(0,13),quantidade:Number(item.quantidade)||0,valor:Number(item.valor)||0,status:item.status==='pago'?'pago':'pix_gerado',pego:item.pego===true,criado_em:item.criado_em||new Date().toISOString(),ultimo_pix_em:item.ultimo_pix_em||item.criado_em||new Date().toISOString(),pago_em:item.pago_em||null,transacoes:Array.isArray(item.transacoes)?item.transacoes.slice(0,100).filter(t=>ID_RE.test(String(t.id||''))).map(t=>({id:String(t.id),quantidade:Number(t.quantidade)||0,valor:Number(t.valor)||0,criado_em:t.criado_em||new Date().toISOString(),status:t.status==='pago'?'pago':'pix_gerado'})):[]};
+    await saveFicha(clean);await redis('ZADD','fichas:indices',new Date(clean.ultimo_pix_em).getTime()||Date.now(),clean.id);await redis('SET',`cpfidx:${clean.cpf}`,clean.id,'EX',TTL);for(const t of clean.transacoes)await redis('SET',`tx:${t.id}`,clean.id,'EX',TTL);imported++;
+   }return res.json({ok:true,imported,skipped});
+  }
   if(req.method==='POST'){
    const x=req.body||{};
    // Atualização de status para "pago" enviada pelo site após confirmação do PIX
@@ -79,7 +89,7 @@ export default async function handler(req,res){
     item.transacoes=transacoesDe(item);
     const t=item.transacoes.find(t=>t.id===txId);
     if(t&&isPago(t.status))return res.status(200).json({ok:true});
-    if(!(await pagoNoGateway(txId,x.route)))return res.status(409).json({error:'Pagamento não confirmado'});
+    if(!(await pagoNoGateway(txId)))return res.status(409).json({error:'Pagamento não confirmado'});
     if(t)t.status='pago';
     item.status='pago';item.pago_em=new Date().toISOString();
     await saveFicha(item);
@@ -118,6 +128,7 @@ export default async function handler(req,res){
   if(req.method==='GET'){
    const ids=await redis('ZREVRANGE','fichas:indices',0,999)||[];
    const rows=(await Promise.all(ids.map(getFicha))).filter(Boolean);
+   if(req.query.action==='export')return res.status(200).json({format:'fichas-portable-v1',exported_at:new Date().toISOString(),fichas:rows});
    return res.status(200).json({fichas:agrupar(rows)});
   }
   if(req.method==='PATCH'){
