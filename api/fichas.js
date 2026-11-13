@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 const url=process.env.UPSTASH_REDIS_REST_URL;
 const token=process.env.UPSTASH_REDIS_REST_TOKEN;
+// Fichas e índices históricos não expiram automaticamente.
 const TTL=60*60*24*90;
 const ID_RE=/^[-\w]{5,128}$/;
 
@@ -21,7 +22,7 @@ async function getFicha(id){
  if(!data)return null;
  try{return JSON.parse(data)}catch{return null}
 }
-const saveFicha=item=>redis('SET',`ficha:${item.id}`,JSON.stringify(item),'EX',TTL);
+const saveFicha=item=>redis('SET',`ficha:${item.id}`,JSON.stringify(item));
 const isPago=s=>s==='pago';
 
 // Fichas antigas não têm a lista de transações: cria a partir dos campos da própria ficha
@@ -70,11 +71,21 @@ export default async function handler(req,res){
   if(req.method==='POST'&&req.body?.action==='import'){
    if(!authorized(req))return res.status(401).json({error:'Não autorizado'});
    const payload=req.body.payload||{},rows=payload.fichas;
-   if(payload.format!=='fichas-portable-v1'||!Array.isArray(rows)||rows.length>1000)return res.status(400).json({error:'JSON inválido ou lote acima de 1000 fichas'});
+   if(payload.format!=='fichas-portable-v1'||!Array.isArray(rows)||rows.length>250)return res.status(400).json({error:'JSON inválido ou lote acima de 250 fichas'});
    let imported=0,skipped=0;
    for(const item of rows){if(!item||!ID_RE.test(String(item.id||''))||!/^\d{11}$/.test(String(item.cpf||''))||await getFicha(item.id)){skipped++;continue}
+    const cpfKey=String(item.cpf);const previousId=await redis('GET',`cpfidx:${cpfKey}`);const previous=previousId?await getFicha(previousId):null;
     const clean={id:String(item.id),cpf:String(item.cpf),nome:String(item.nome||'').slice(0,120),data_nascimento:String(item.data_nascimento||'').slice(0,30),telefone:String(item.telefone||'').replace(/\D/g,'').slice(0,13),quantidade:Number(item.quantidade)||0,valor:Number(item.valor)||0,status:item.status==='pago'?'pago':'pix_gerado',pego:item.pego===true,criado_em:item.criado_em||new Date().toISOString(),ultimo_pix_em:item.ultimo_pix_em||item.criado_em||new Date().toISOString(),pago_em:item.pago_em||null,transacoes:Array.isArray(item.transacoes)?item.transacoes.slice(0,100).filter(t=>ID_RE.test(String(t.id||''))).map(t=>({id:String(t.id),quantidade:Number(t.quantidade)||0,valor:Number(t.valor)||0,criado_em:t.criado_em||new Date().toISOString(),status:t.status==='pago'?'pago':'pix_gerado'})):[]};
-    await saveFicha(clean);await redis('ZADD','fichas:indices',new Date(clean.ultimo_pix_em).getTime()||Date.now(),clean.id);await redis('SET',`cpfidx:${clean.cpf}`,clean.id,'EX',TTL);for(const t of clean.transacoes)await redis('SET',`tx:${t.id}`,clean.id,'EX',TTL);imported++;
+    if(previous){
+     previous.transacoes=transacoesDe(previous);const ids=new Set(previous.transacoes.map(t=>t.id));
+     for(const t of transacoesDe(clean)){if(!ids.has(t.id)){previous.transacoes.push(t);ids.add(t.id)}await redis('SET',`tx:${t.id}`,previous.id)}
+     previous.pego=!!(previous.pego||clean.pego);previous.status=previous.transacoes.some(t=>t.status==='pago')?'pago':previous.status;
+     previous.pago_em=[previous.pago_em,clean.pago_em].filter(Boolean).sort().pop()||null;
+     previous.nome=previous.nome||clean.nome;previous.telefone=previous.telefone||clean.telefone;
+     previous.ultimo_pix_em=[previous.ultimo_pix_em,clean.ultimo_pix_em].filter(Boolean).sort().pop();
+     await saveFicha(previous);await redis('ZADD','fichas:indices',new Date(previous.ultimo_pix_em).getTime()||Date.now(),previous.id);imported++;continue;
+    }
+    await saveFicha(clean);await redis('ZADD','fichas:indices',new Date(clean.ultimo_pix_em).getTime()||Date.now(),clean.id);await redis('SET',`cpfidx:${clean.cpf}`,clean.id);for(const t of clean.transacoes)await redis('SET',`tx:${t.id}`,clean.id);imported++;
    }return res.json({ok:true,imported,skipped});
   }
   if(req.method==='POST'){
@@ -111,24 +122,24 @@ export default async function handler(req,res){
     Object.assign(existente,{nome:dados.nome||existente.nome,data_nascimento:dados.data_nascimento||existente.data_nascimento,telefone:tel,ultimo_pix_em:agora});
     if(!isPago(existente.status)){existente.quantidade=qtd;existente.valor=valor}
     await saveFicha(existente);
-    await redis('SET',`tx:${id}`,existente.id,'EX',TTL);
-    await redis('EXPIRE',`cpfidx:${cpf}`,TTL);
+    await redis('SET',`tx:${id}`,existente.id);
+    
     await redis('ZADD','fichas:indices',Date.now(),existente.id);
     return res.status(200).json({ok:true,agrupada:true});
    }
    const item={id,cpf,...dados,quantidade:qtd,valor,status:'pix_gerado',pego:false,criado_em:agora,ultimo_pix_em:agora,transacoes:[nova]};
    await saveFicha(item);
-   await redis('SET',`cpfidx:${cpf}`,id,'EX',TTL);
-   await redis('SET',`tx:${id}`,id,'EX',TTL);
+   await redis('SET',`cpfidx:${cpf}`,id);
+   await redis('SET',`tx:${id}`,id);
    await redis('ZADD','fichas:indices',Date.now(),id);
    return res.status(201).json({ok:true});
   }
   if(!authorized(req))return res.status(401).json({error:'Acesso não autorizado'});
   const listaIds=x=>[...new Set((Array.isArray(x)?x:String(x||'').split(',')).map(String).filter(i=>ID_RE.test(i)))].slice(0,50);
   if(req.method==='GET'){
-   const ids=await redis('ZREVRANGE','fichas:indices',0,999)||[];
+   const isExport=req.query.action==='export';const start=Math.max(0,Number.parseInt(req.query.offset,10)||0);const limit=isExport?250:5000;const ids=await redis('ZREVRANGE','fichas:indices',isExport?start:0,(isExport?start:0)+limit-1)||[];
    const rows=(await Promise.all(ids.map(getFicha))).filter(Boolean);
-   if(req.query.action==='export')return res.status(200).json({format:'fichas-portable-v1',exported_at:new Date().toISOString(),fichas:rows});
+   if(isExport)return res.status(200).json({format:'fichas-portable-v1',exported_at:new Date().toISOString(),offset:start,next_offset:ids.length===limit?start+ids.length:null,fichas:rows});
    return res.status(200).json({fichas:agrupar(rows)});
   }
   if(req.method==='PATCH'){
